@@ -2,7 +2,7 @@
   "services": [
     {
       "name": "web",
-      "image": "ghcr.io/moai-labs/opencalendly",
+      "image": "registry.fly.io/fl-dev-1ec8a632-9802-40e2-9570-8d87fed7f9a1",
       "port": 3000,
       "cpus": 1,
       "memory_mb": 512,
