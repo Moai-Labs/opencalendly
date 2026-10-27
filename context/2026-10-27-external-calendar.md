@@ -185,3 +185,36 @@ All five requested changes were made on this branch:
    checked". The merge-order point — steps 1–3 first, rebase, then this
    branch — is stated; only the platform can perform those merges, and the
    request stands recorded in the posts.
+
+## Review round 3 (2026-10-27)
+
+The review asked for two things; the state of each:
+
+1. **Unneeded response bodies in the fetcher.** Made. `requestAt` used to
+   `res.resume()` the bodies of redirect and error responses — an unbounded
+   drain outside MAX_FEED_BYTES, with the timeout cleared at `finish`, and a
+   socket plus bandwidth still busy while the next redirect hop started.
+   Redirect and error bodies are now never read: the connection is destroyed
+   at once, so nothing can stream at us outside the cap and no socket
+   outlives the hop. The promise is settled before the destroy, so the close
+   cannot clobber the redirect/error outcome. Two regression tests serve
+   responses (302 and 503) whose bodies stream forever and assert the
+   server-side connection closes promptly with bounded bytes; under the old
+   behavior those tests hang — the connection never closes — which is the
+   bug the review found, demonstrated. Full suite: 137 automated tests pass.
+2. **Prerequisites and the dev-stack test.** The unmerged state is kept:
+   this branch stays unmerged until Steps 1–3 are separately merged and
+   verified, and it rebases onto those merges before its own (see the
+   Prerequisites section above — only the platform can perform those
+   merges, and the operator requests stand on posts 20, 21 and 22). The
+   dev-stack verification is still outstanding, and this session could not
+   obtain it: the dev stack deploys from a pushed branch at session end, no
+   preview address exists yet, and the dev-stack host does not resolve from
+   this workspace, so there is nothing to test against from here. The
+   operator has been asked (on the post's thread) to run the booking-page
+   test against the deployed preview once it exists. What that run must
+   show, unchanged from the plan above: a connected feed's busy interval is
+   hidden on the booking page, a direct booking POST against it is refused
+   (409), and the page's note states when the calendar was last checked.
+   Nothing is claimed as dev-stack-verified until that has run and its
+   actual results are recorded in this file.
