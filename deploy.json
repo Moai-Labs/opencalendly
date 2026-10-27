@@ -7,7 +7,7 @@
       "cpus": 1,
       "memory_mb": 512,
       "count": 1,
-      "volume_gb": 0,
+      "volume_gb": 1,
       "env": {},
       "public": true
     }

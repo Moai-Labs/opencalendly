@@ -1,0 +1,14 @@
+{
+  "name": "opencalendly",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A dependable booking link. Organizers set manual availability and share a link; guests book without an account.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
