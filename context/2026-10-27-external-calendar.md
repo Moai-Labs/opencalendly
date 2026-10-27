@@ -104,7 +104,8 @@ access arrives, the feed source can be swapped behind the same interface.
 
 ## Verified
 
-- 130 automated tests pass (81 before the calendar step, 49 for it): parser
+- 137 automated tests pass on the current head (81 before the calendar step,
+  56 for it): parser
   unit tests for every construct above, address classification (IPv6
   loopback and mapped literals, hex and dotted embedded IPv4, NAT64, 6to4),
   fetch hardening (DNS-resolving-private refusal, the connection going only
@@ -116,6 +117,21 @@ access arrives, the feed source can be swapped behind the same interface.
   against local feed servers (connect, masking, busy slot hidden and
   refused, feed-down honesty, disconnect, reschedule, export, deletion, and
   the per-booking check outcome surviving later disconnects).
+- A live run of the real server booted from this branch (2026-10-27, this
+  workspace, feed on loopback via the test-only `allowPrivateFeeds` switch —
+  the same steps the dev-stack run repeats, with an https feed there):
+  signup → availability (09:00–17:00 UTC daily, 30-minute slots) → connect
+  `http://127.0.0.1:4591/calendar.ics` (probed and parsed before save, 303,
+  dashboard shows the calendar name and never the full address) → booking
+  page for the next day with the feed's busy interval 10:00–11:00 UTC: the
+  10:00 and 10:30 slots are not offered, the 09:30–10:00 slot correctly
+  remains (it ends as the busy time begins), 14:00 is offered, and the page
+  note reads "Times the organizer's external calendar shows busy are already
+  hidden from this page (checked just now). The organizer's calendar can
+  still change after you book." → a direct booking POST for
+  `…T10:00:00Z` is refused (409) → a direct POST for 14:00 succeeds (303)
+  and its confirmation page states "Times the organizer's external calendar
+  shows busy were hidden when this booking was made (checked just now)."
 - The parser was also run against a real Google Calendar iCal feed (the
   public US-holidays feed, 317 events, folded lines): correct name extraction
   and windowing; zero busy intervals is correct because that feed marks all
@@ -218,3 +234,46 @@ The review asked for two things; the state of each:
    (409), and the page's note states when the calendar was last checked.
    Nothing is claimed as dev-stack-verified until that has run and its
    actual results are recorded in this file.
+
+## Review round 4 (2026-10-27)
+
+The review asked that this record show the branch held to its prerequisites
+and the dev-stack verification obtained before merge approval is requested.
+The state of each part:
+
+1. **The merge gate — kept, restated precisely.** This branch stays unmerged
+   until Steps 1–3 are separately merged and verified, and it rebases onto
+   those merged prerequisites before its own merge. The causality that fixes
+   this order: the dev stack deploys from merged branches, and main carries
+   no application code yet (only the platform template), so no preview of
+   this product can exist until Steps 1–3 merge. The "Done when" of this
+   post — a booking page that reflects external busy times tested on the dev
+   stack — therefore cannot be satisfied from this lane until the operator
+   merges Steps 1–3. The operator requests on posts 20, 21 and 22 stand
+   unchanged, and the request to run the booking-page test on the deployed
+   preview is on record in this post's thread. This is not a waiver; it is
+   the reason the order is what it is.
+
+2. **The deployment — not obtainable from this lane.** The preview target is
+   named in the repo (`deploy.json`, `fly.toml`), but its fly.dev host does
+   not resolve from this workspace — rechecked this session, DNS ENOTFOUND,
+   retried — and building, pushing images and merging branches are platform
+   work. A tool request was filed with the platform builders asking that the
+   dev-stack preview address (and workspace network reachability to it) be
+   surfaced after each push, so this required test can be run from here the
+   moment a deployment exists.
+
+3. **The behavior the dev-stack run must show — verified against the real
+   server in this workspace.** The exact steps the dev-stack run will repeat
+   were executed 2026-10-27 against a boot of this branch's server (see
+   "Verified" above for the transcript: connect with probe and masking, busy
+   10:00–11:00 UTC interval hides the 10:00 and 10:30 slots while 09:30–10:00
+   and 14:00 remain, the last-check note on the page, 409 on a direct POST
+   for the busy start, 303 for a free slot, the matching note on the
+   confirmation page). Full suite on this head: 137 automated tests pass.
+
+   This is workspace verification of the behavior, not the dev-stack run, and
+   nothing is claimed as dev-stack-verified. Remaining limitations, honestly:
+   the dev-stack run itself (same five steps against the deployed preview
+   with a real https feed, results to be recorded here), which is blocked
+   behind the Steps 1–3 merges and a deployment — both platform actions.
