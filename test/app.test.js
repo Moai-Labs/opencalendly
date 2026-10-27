@@ -280,3 +280,182 @@ test("health endpoint responds", async () => {
   assert.strictEqual(res.status, 200);
 });
 
+
+// --- Step 2: cancel, reschedule, export, delete ------------------------------
+
+// Every open slot's ISO start, in page order.
+async function slotStarts(ctx, slug, tz = "UTC") {
+  const res = await fetch(`${ctx.base}/b/${slug}?tz=${encodeURIComponent(tz)}`);
+  assert.strictEqual(res.status, 200);
+  const text = await res.text();
+  const starts = [...text.matchAll(/\/b\/[a-z0-9]+\/new\?start=([^&"]+)/g)].map((m) => decodeURIComponent(m[1]));
+  assert.ok(starts.length >= 3, "the page offers at least three slots");
+  return starts;
+}
+
+// Book one slot for a guest; returns the booking id.
+async function book(ctx, slug, startIso, guest = { name: "Grace Guest", email: "grace@example.com" }) {
+  const res = await post(`${ctx.base}/b/${slug}/book`, {
+    start: startIso, tz: "UTC", guest_name: guest.name, guest_email: guest.email,
+  });
+  assert.strictEqual(res.status, 303, "booking succeeds");
+  const match = res.headers.get("location").match(/\/confirmed\/([0-9a-f]+)/);
+  assert.ok(match);
+  return match[1];
+}
+
+test("a guest cancels from their confirmation and the slot opens again", async () => {
+  const ctx = await start();
+  const org = await signup(ctx);
+  const [taken] = await slotStarts(ctx, org.slug);
+  const id = await book(ctx, org.slug, taken);
+
+  // The confirmation page offers both actions.
+  const confirmHtml = await (await fetch(`${ctx.base}/b/${org.slug}/confirmed/${id}`)).text();
+  assert.ok(confirmHtml.includes(`/b/${org.slug}/cancel/${id}`), "cancel linked from the confirmation");
+  assert.ok(confirmHtml.includes(`/b/${org.slug}/reschedule/${id}`), "reschedule linked from the confirmation");
+
+  // The cancel link asks first.
+  const ask = await fetch(`${ctx.base}/b/${org.slug}/cancel/${id}`);
+  assert.strictEqual(ask.status, 200);
+  assert.ok((await ask.text()).includes("Cancel this booking?"));
+
+  const cancel = await post(`${ctx.base}/b/${org.slug}/cancel/${id}`, { tz: "UTC" });
+  assert.strictEqual(cancel.status, 303);
+  const gone = await (await fetch(`${ctx.base}/b/${org.slug}/cancelled/${id}`)).text();
+  assert.ok(gone.includes("Booking cancelled"));
+
+  // The confirmation link now tells the truth too.
+  const confirmAfter = await (await fetch(`${ctx.base}/b/${org.slug}/confirmed/${id}`)).text();
+  assert.ok(confirmAfter.includes("This booking was cancelled"));
+  assert.ok(!confirmAfter.includes("/cancel/"), "a cancelled booking offers no further actions");
+
+  // The freed slot is offered again, and the calendar file says cancelled.
+  const page = await (await fetch(`${ctx.base}/b/${org.slug}?tz=UTC`)).text();
+  assert.ok(page.includes(`start=${encodeURIComponent(taken)}`), "the freed slot is bookable again");
+  const ics = await (await fetch(`${ctx.base}/cal/${id}.ics`)).text();
+  assert.ok(ics.includes("STATUS:CANCELLED"));
+
+  // Both sides are told.
+  const queued = ctx.store.state.outbox.filter((e) => /cancelled/i.test(e.subject));
+  assert.strictEqual(queued.length, 2);
+  assert.ok(queued.some((e) => e.to === "grace@example.com" && e.text.includes("slot is free again")));
+  assert.ok(queued.some((e) => e.to === ctx.store.findOrganizerBySlug(org.slug).email));
+
+  // Cancelling twice stays calm instead of erroring.
+  const again = await post(`${ctx.base}/b/${org.slug}/cancel/${id}`, { tz: "UTC" });
+  assert.strictEqual(again.status, 303);
+});
+
+test("a guest reschedules; a slot another guest just took is refused with the picker shown", async () => {
+  const ctx = await start();
+  const org = await signup(ctx);
+  const [first, second, third] = await slotStarts(ctx, org.slug);
+  const id = await book(ctx, org.slug, first);
+  await book(ctx, org.slug, second, { name: "Other Guest", email: "other@example.com" });
+
+  const page = await fetch(`${ctx.base}/b/${org.slug}/reschedule/${id}?tz=UTC`);
+  assert.strictEqual(page.status, 200);
+  assert.ok((await page.text()).includes("Move your booking"));
+
+  // The target slot was just taken by the other guest.
+  const clash = await post(`${ctx.base}/b/${org.slug}/reschedule/${id}`, { start: second, tz: "UTC" });
+  assert.strictEqual(clash.status, 409);
+  assert.ok((await clash.text()).includes("just taken"));
+  assert.strictEqual(ctx.store.findBooking(id).startMs, Date.parse(first), "the booking did not move");
+
+  // A free slot works; the old one opens up.
+  const ok = await post(`${ctx.base}/b/${org.slug}/reschedule/${id}`, { start: third, tz: "UTC" });
+  assert.strictEqual(ok.status, 303);
+  assert.match(ok.headers.get("location"), /rescheduled=1/);
+  const moved = await (await fetch(`${ctx.base}/b/${org.slug}/confirmed/${id}?tz=UTC&rescheduled=1`)).text();
+  assert.ok(moved.includes("Booking moved"));
+  const publicPage = await (await fetch(`${ctx.base}/b/${org.slug}?tz=UTC`)).text();
+  assert.ok(publicPage.includes(`start=${encodeURIComponent(first)}`), "the old slot is bookable again");
+
+  // Both sides are told, with the previous time included.
+  const queued = ctx.store.state.outbox.filter((e) => /rescheduled/i.test(e.subject));
+  assert.strictEqual(queued.length, 2);
+  assert.ok(queued.every((e) => e.text.includes("Was:")), "both emails show the previous time");
+
+  // Re-picking the slot the booking already holds is a calm no-op.
+  const own = await post(`${ctx.base}/b/${org.slug}/reschedule/${id}`, { start: third, tz: "UTC" });
+  assert.strictEqual(own.status, 303);
+
+  // A cancelled booking cannot be rescheduled.
+  await post(`${ctx.base}/b/${org.slug}/cancel/${id}`, { tz: "UTC" });
+  const dead = await post(`${ctx.base}/b/${org.slug}/reschedule/${id}`, { start: third, tz: "UTC" });
+  assert.strictEqual(dead.status, 409);
+});
+
+test("the reschedule race over HTTP: a reschedule and another guest's booking fight for one slot", async () => {
+  const ctx = await start();
+  const org = await signup(ctx);
+  const [, a, b] = await slotStarts(ctx, org.slug);
+  const id = await book(ctx, org.slug, a, { name: "One", email: "one@example.com" });
+
+  const [bookRes, moveRes] = await Promise.all([
+    post(`${ctx.base}/b/${org.slug}/book`, { start: b, tz: "UTC", guest_name: "Two", guest_email: "two@example.com" }),
+    post(`${ctx.base}/b/${org.slug}/reschedule/${id}`, { start: b, tz: "UTC" }),
+  ]);
+  const statuses = [bookRes.status, moveRes.status].sort();
+  assert.deepStrictEqual(statuses, [303, 409], "exactly one of the two requests wins");
+
+  // Whatever won, exactly one active booking holds slot b.
+  const target = Date.parse(b);
+  const holders = ctx.store.state.bookings.filter(
+    (x) => x.status !== "cancelled" && x.startMs < target + 30 * 60000 && target < x.endMs
+  );
+  assert.strictEqual(holders.length, 1);
+  assert.strictEqual(ctx.store.findBooking(id).status, "confirmed", "the moving booking still exists");
+});
+
+test("organizer cancel, export and account deletion close the data loop", async () => {
+  const ctx = await start();
+  const org = await signup(ctx);
+  const [taken] = await slotStarts(ctx, org.slug);
+  const id = await book(ctx, org.slug, taken);
+
+  const dash = await (await fetch(`${ctx.base}/dashboard`, { headers: { cookie: org.cookie } })).text();
+  assert.ok(dash.includes("/dashboard/cancel/"), "the dashboard offers cancel");
+  assert.ok(dash.includes("/dashboard/export"), "the dashboard offers export");
+  assert.ok(dash.includes("/dashboard/delete"), "the dashboard offers deletion");
+
+  const cancelled = await post(`${ctx.base}/dashboard/cancel/${id}`, {}, { cookie: org.cookie });
+  assert.strictEqual(cancelled.status, 303);
+  assert.strictEqual(ctx.store.findBooking(id).status, "cancelled");
+  const dashAfter = await (await fetch(`${ctx.base}/dashboard`, { headers: { cookie: org.cookie } })).text();
+  assert.ok(!dashAfter.includes(`/dashboard/cancel/${id}`), "the cancelled booking leaves the upcoming list");
+
+  // The export is the organizer's own data, without password material.
+  const exportRes = await fetch(`${ctx.base}/dashboard/export`, { headers: { cookie: org.cookie } });
+  assert.strictEqual(exportRes.status, 200);
+  assert.match(exportRes.headers.get("content-disposition"), /attachment/);
+  const exported = await exportRes.json();
+  assert.strictEqual(exported.organizer.slug, org.slug);
+  assert.strictEqual(exported.bookings.length, 1);
+  assert.strictEqual(exported.bookings[0].status, "cancelled");
+  assert.ok(!JSON.stringify(exported).includes("passwordHash"), "no password hash in the export");
+
+  // Deletion asks for the password and refuses a wrong one.
+  const deletePage = await fetch(`${ctx.base}/dashboard/delete`, { headers: { cookie: org.cookie } });
+  assert.strictEqual(deletePage.status, 200);
+  const wrong = await post(`${ctx.base}/dashboard/delete`, { password: "not the password" }, { cookie: org.cookie });
+  assert.strictEqual(wrong.status, 401);
+  assert.strictEqual(ctx.store.state.organizers.length, 1, "nothing was deleted");
+
+  const right = await post(`${ctx.base}/dashboard/delete`, { password: "correct horse battery" }, { cookie: org.cookie });
+  assert.strictEqual(right.status, 303);
+  assert.match(right.headers.get("set-cookie"), /oc_session=;/, "the session is cleared");
+  assert.strictEqual(ctx.store.state.organizers.length, 0);
+
+  // The public page is gone, the guest's links answer honestly without data,
+  // and the export route no longer exists for anyone.
+  assert.strictEqual((await fetch(`${ctx.base}/b/${org.slug}`)).status, 404);
+  const ghost = await (await fetch(`${ctx.base}/b/${org.slug}/confirmed/${id}`)).text();
+  assert.ok(ghost.includes("Booking cancelled"));
+  assert.ok(ghost.includes("account was deleted"), "the guest is told the data is gone");
+  assert.ok(!ghost.includes("grace@example.com"), "the guest's own data is gone too");
+  const exportGone = await fetch(`${ctx.base}/dashboard/export`, { headers: { cookie: org.cookie }, redirect: "manual" });
+  assert.strictEqual(exportGone.status, 303, "the deleted organizer's session leads back to login");
+});
