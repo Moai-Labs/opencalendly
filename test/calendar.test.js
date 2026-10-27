@@ -403,6 +403,70 @@ test("redirects are followed and every hop is fetched through the same guard", a
   }
 });
 
+// A response whose body never ends: the fetcher must close the connection
+// instead of draining it. The first request gets the streaming response; the
+// server reports when its side of the connection closed and how many bytes
+// had gone out by then. Later requests go to `laterHandler`.
+function streamingServer(status, headers, laterHandler) {
+  let report;
+  const closed = new Promise((r) => (report = r));
+  let streaming = null;
+  const server = http.createServer((req, res) => {
+    if (streaming !== null) return laterHandler(req, res);
+    streaming = setInterval(() => {
+      try {
+        if (!res.destroyed && !res.writableEnded) res.write(Buffer.alloc(8192, 120));
+      } catch {}
+    }, 5);
+    res.writeHead(status, headers);
+    res.on("close", () => {
+      clearInterval(streaming);
+      report({ bytes: res.socket ? res.socket.bytesWritten : 0 });
+    });
+  });
+  return { server, closed };
+}
+
+async function closeReport(closed, ms) {
+  return Promise.race([closed, new Promise((r) => setTimeout(() => r(null), ms))]);
+}
+
+test("a redirect response that streams forever is closed promptly, not drained", async () => {
+  const { server, closed } = streamingServer(302, { location: "/two" }, (req, res) => {
+    res.writeHead(200, { "content-type": "text/calendar" });
+    res.end(ics(...event(["UID:36@t", "DTSTART:20300101T100000Z", "DTEND:20300101T103000Z"])));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}/one`;
+  try {
+    const t0 = Date.now();
+    const text = await calendarfeed.fetchFeedText(url, { allowPrivate: true });
+    assert.ok(text.includes("BEGIN:VEVENT"), "the redirect itself is still followed");
+    const report = await closeReport(closed, 2000);
+    assert.ok(report, "the streaming redirect connection closed promptly");
+    assert.ok(Date.now() - t0 < 5000);
+    assert.ok(report.bytes < 1024 * 1024, `the discarded body was not drained (${report.bytes} bytes out)`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("an error response that streams forever is closed promptly, not drained", async () => {
+  const { server, closed } = streamingServer(503, {}, (req, res) => res.end("unused"));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}/feed.ics`;
+  try {
+    const t0 = Date.now();
+    await assert.rejects(() => calendarfeed.fetchFeedText(url, { allowPrivate: true }), /503/);
+    const report = await closeReport(closed, 2000);
+    assert.ok(report, "the streaming error connection closed promptly");
+    assert.ok(Date.now() - t0 < 5000);
+    assert.ok(report.bytes < 1024 * 1024, `the discarded body was not drained (${report.bytes} bytes out)`);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
 test("an HTML error page is a failed read, not an empty calendar", async () => {
   const reader = calendarfeed.createFeedReader({ readFeed: async () => "<html><body>rate limited</body></html>" });
   const res = await reader.read("https://example.invalid/feed.ics", 60000);
