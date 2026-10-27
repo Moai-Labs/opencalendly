@@ -7,8 +7,10 @@
       "cpus": 1,
       "memory_mb": 512,
       "count": 1,
-      "volume_gb": 0,
-      "env": {},
+      "volume_gb": 1,
+      "env": {
+        "PAY_TEST_ADDRESS": "0x2f50aa285c060f4a579f2c0256e8b7a754b1205d"
+      },
       "public": true
     }
   ]
