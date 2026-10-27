@@ -8,12 +8,12 @@ const RECIPIENT = "0x2f50aa285c060f4a579f2c0256e8b7a754b1205d";
 const TOKEN = "0x036cbd53842c5426634e7929541ec2318f3dcf7e";
 const HASH = "0x" + "ab".repeat(32);
 
-function transferLog({ to = RECIPIENT, amount = 8_000_123n, token = TOKEN } = {}) {
+function transferLog({ to = RECIPIENT, from = "0x" + "11".repeat(20), amount = 8_000_123n, token = TOKEN } = {}) {
   return {
     address: token,
     topics: [
       TRANSFER_TOPIC,
-      "0x" + "00".repeat(12) + "1111111111111111111111111111111111111111",
+      "0x" + "00".repeat(12) + from.slice(2).toLowerCase(),
       "0x" + "00".repeat(12) + to.slice(2).toLowerCase(),
     ],
     data: "0x" + amount.toString(16),
@@ -93,4 +93,29 @@ test("address comparison is case-insensitive; other events on the token are igno
   const { rpcCall } = stubRpc({ status: "0x1", logs: [{ address: TOKEN, topics: ["0xother", "0x1", "0x" + "00".repeat(12) + RECIPIENT.slice(2)], data: "0x1" }, checksummed] });
   const verdict = await verifyTestPayment({ rpcCall, txHash: HASH, recipient: RECIPIENT.toUpperCase(), token: TOKEN, expectedAmountMinor: 8_000_123n });
   assert.strictEqual(verdict.ok, true);
+});
+
+test("the transfer's sender must match the intent's declared address", async () => {
+  const declared = "0x" + "aa".repeat(20);
+  // Exact amount, right recipient, wrong sender: no match.
+  const wrongSender = { status: "0x1", logs: [transferLog({ from: "0x" + "bb".repeat(20) })] };
+  const { rpcCall } = stubRpc(wrongSender);
+  const verdict = await verifyTestPayment({
+    rpcCall, txHash: HASH, recipient: RECIPIENT, token: TOKEN, expectedAmountMinor: 8_000_123n, fromAddress: declared,
+  });
+  assert.strictEqual(verdict.ok, false);
+  assert.strictEqual(verdict.code, "no_matching_transfer");
+  // The same transfer verifies once the declared address matches.
+  const { rpcCall: rpcCall2 } = stubRpc({ status: "0x1", logs: [transferLog({ from: declared })] });
+  const ok = await verifyTestPayment({
+    rpcCall: rpcCall2, txHash: HASH, recipient: RECIPIENT, token: TOKEN, expectedAmountMinor: 8_000_123n, fromAddress: declared,
+  });
+  assert.deepStrictEqual(ok, { ok: true, blockNumber: "0" });
+  // Sender comparison is case-insensitive, like the recipient's.
+  const checksummed = "0x" + "Aa".repeat(20);
+  const { rpcCall: rpcCall3 } = stubRpc({ status: "0x1", logs: [transferLog({ from: declared })] });
+  const ok2 = await verifyTestPayment({
+    rpcCall: rpcCall3, txHash: HASH, recipient: RECIPIENT, token: TOKEN, expectedAmountMinor: 8_000_123n, fromAddress: checksummed,
+  });
+  assert.strictEqual(ok2.ok, true);
 });

@@ -31,14 +31,31 @@ test("a grant extends from the later of now and the current expiry", () => {
   assert.strictEqual(plans.grantUntil(now - DAY, now), now + 30 * DAY);
 });
 
-test("payment references encode the exact amount", () => {
-  assert.strictEqual(plans.amountForRef(1), 8_000_001n);
-  assert.strictEqual(plans.amountForRef(999_999), 8_999_999n);
-  assert.strictEqual(plans.amountForRef(0), null);
-  assert.strictEqual(plans.amountForRef(1_000_000), null);
-  assert.strictEqual(plans.amountForRef(1.5), null);
-  assert.ok(plans.refIsValid(plans.newRef()));
-  assert.strictEqual(plans.fmtAmount(8_000_000n), "8.000000");
-  assert.strictEqual(plans.fmtAmount(8_000_123n), "8.000123");
-  assert.strictEqual(plans.fmtAmount(8_999_999n), "8.999999");
+test("the price is exactly 8.000000 test-USDC for every payment", () => {
+  assert.strictEqual(plans.PRICE_MINOR, 8_000_000n);
+  assert.strictEqual(plans.fmtAmount(plans.PRICE_MINOR), "8.000000");
+  // An intent always carries the same exact amount.
+  const intent = plans.newIntent("org-1", "0x" + "11".repeat(20));
+  assert.strictEqual(BigInt(intent.amountMinor), plans.PRICE_MINOR);
+  assert.ok(intent.id.length >= 32, "an intent id is unguessable");
+  assert.ok(Number(intent.expiresAt) > intent.createdAt, "an intent expires");
+});
+
+test("a declared sending address looks like an address", () => {
+  assert.strictEqual(plans.addressIsValid("0x" + "11".repeat(20)), true);
+  assert.strictEqual(plans.addressIsValid("0X" + "11".repeat(20).toUpperCase()), true);
+  assert.strictEqual(plans.addressIsValid("0x1234"), false);
+  assert.strictEqual(plans.addressIsValid("not an address"), false);
+  assert.strictEqual(plans.addressIsValid(""), false);
+});
+
+test("on the free tier only the first event type stays bookable; paid unlocks all", () => {
+  const now = Date.now();
+  const types = [{ id: "a", createdAt: 1 }, { id: "b", createdAt: 2 }, { id: "c", createdAt: 3 }];
+  // Free: the extra types are paused, not deleted.
+  assert.deepStrictEqual(plans.activeEventTypes({ eventTypes: types }, now), [types[0]]);
+  // Paid: all three are bookable again, in creation order.
+  assert.deepStrictEqual(plans.activeEventTypes({ eventTypes: types, paidUntil: now + DAY }, now), types);
+  // A one-type organizer is unaffected either way.
+  assert.deepStrictEqual(plans.activeEventTypes({ eventTypes: [types[0]] }, now), [types[0]]);
 });
