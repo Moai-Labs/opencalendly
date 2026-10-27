@@ -123,18 +123,65 @@ access arrives, the feed source can be swapped behind the same interface.
 
 ## Prerequisites and the dev-stack test (honest status)
 
+Updated 2026-10-27 after review round 2 (all five requested changes are
+made; see below).
+
 - The post requires Steps 1–3 to be merged and verified before this work.
   They are NOT yet merged: review could not complete on branches post-20,
   post-21 and post-22 (three attempts), the operator was asked, and those
   posts are paused. This branch is therefore stacked on the post-22 head
   (036eac0), which carries the full steps 1–3 implementation; it cannot
   rebase onto merged prerequisites that do not exist yet. The moment steps
-  1–3 merge, this branch rebases onto the result before its own merge.
+  1–3 merge, this branch rebases onto the result before its own merge. Until
+  then this branch should not merge either: the stack would merge without
+  its verified base. This is a platform-limitation fact, not a waiver.
 - The dev-stack booking-page test has not run yet: the dev stack deploys
-  from a pushed branch after review, not from this workspace. The planned
-  test, to exercise on the deployed preview: connect a feed that contains a
-  real busy interval inside the booking window, confirm the booking page
-  hides that slot, confirm a direct booking POST against it is refused
-  (409), and confirm the page's note states when the calendar was last
-  checked. Nothing is claimed as dev-stack-verified until that has been
-  done and recorded here.
+  from a pushed branch after review, not from this workspace — an
+  operator-assisted run is needed. The planned test, to exercise on the
+  deployed preview: connect a feed that contains a real busy interval inside
+  the booking window, confirm the booking page hides that slot, confirm a
+  direct booking POST against it is refused (409), and confirm the page's
+  note states when the calendar was last checked. Nothing is claimed as
+  dev-stack-verified until that has been done and recorded here.
+
+## Review round 2 (2026-10-27)
+
+All five requested changes were made on this branch:
+
+1. **Duration-aware lookback.** `occasionsOf` widens the window's wall dates
+   by the event's own duration (ceil(duration/1 day) + 1 day, plus one margin
+   day) instead of a fixed two-day lookback, so a recurring multi-day event
+   that began days before the window and is still busy inside it is
+   enumerated. Regression test: a weekly 5-day occurrence starting Jan 6
+   blocks a window opening Jan 9.
+2. **WKST ordering.** Weekly candidates are emitted in the order of their
+   offsets from WKST, not by weekday number; the horizon break now lands on
+   the first day past it, never on a later weekday before an in-window
+   earlier one, and COUNT keeps the earliest WKST-days first. Regression
+   test: Sunday DTSTART, WKST=SU, BYDAY=SU,MO, COUNT=1 keeps the Sunday, with
+   a horizon ending between Sunday and Monday.
+3. **Feed-wide budget.** One step budget now belongs to the whole feed parse
+   (400,000 steps) alongside the per-event cap (200,000): many small old
+   recurring events cannot each re-spend a per-event allowance and stall the
+   event loop; exhaustion marks the result approximate. Weekly rules
+   fast-forward to the window with or without COUNT — each elapsed rule-week
+   contributes exactly its named weekdays (week 0's pre-DTSTART days are
+   discounted), so COUNT stays exact; plain DAILY fast-forwards the same way.
+   Regression test: forty daily rules from the year 1000 stop on the feed
+   budget quickly, and the old pathological-rule test now uses a BYDAY daily
+   rule, which genuinely cannot be fast-forwarded.
+4. **The approximate flag is spoken.** `calendarCheckNote` adds an explicit
+   incomplete-recurrence warning to the checked-state note when
+   `calendarCheck.approximate` is true; confirmation emails, reschedule
+   emails (guest and organizer — these now carry the note at all), and .ics
+   descriptions all draw from that one note, and the flag is persisted on the
+   booking, so connecting or disconnecting later cannot rewrite it. Tests:
+   the mailer unit test for all three messages, and an end-to-end flow
+   (BYSETPOS feed → page discloses, ICS discloses, queued email discloses,
+   warning survives disconnect).
+5. **Record-keeping.** This file is that record: the honest prerequisite
+   status above, the dev-stack test plan with nothing claimed as verified
+   until it runs, and the limitations listed under "What is honestly NOT
+   checked". The merge-order point — steps 1–3 first, rebase, then this
+   branch — is stated; only the platform can perform those merges, and the
+   request stands recorded in the posts.
