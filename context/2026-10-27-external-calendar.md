@@ -28,29 +28,51 @@ access arrives, the feed source can be swapped behind the same interface.
 ## What was built
 
 - `lib/calendarfeed.js` — feed URL validation (https/http, no embedded
-  credentials, length cap), a fetcher that refuses private/loopback/link-local
-  hosts (re-checked on every redirect hop, so a public URL cannot bounce the
-  server into probing its own network), and an ICS parser that produces busy
-  intervals: UTC and TZID times, all-day events, DURATION, line unfolding,
-  TRANSP (transparent events block nothing), STATUS:CANCELLED, RRULE
-  (DAILY, WEEKLY with BYDAY, MONTHLY plain and ordinal BYDAY, YEARLY, with
-  INTERVAL, COUNT, UNTIL), EXDATE, and RECURRENCE-ID overrides (a moved or
-  cancelled instance of a recurring event). Expansion steps by the rule's own
-  period, so a DTSTART years in the past costs the same as a fresh one.
-  Rarely-used rule parts (BYSETPOS, plain BYDAY in MONTHLY, ...) fall back to
-  the first occurrence only and mark the result `approximate` — the pages say
-  so.
-- A per-URL cached reader: good reads are reused within a configurable window
-  (a minute by default, ~10 s at the booking POST, which re-checks nearly
-  fresh because the page a guest came from can be minutes old); failures are
-  cached only 15 s so an outage shows an honest "check failed" without
-  hammering the provider.
+  credentials, length cap), and a hardened fetcher: hosts are resolved first
+  and every resolved address is classified against private network space
+  (canonical IPv4, IPv6 literals including the bracketed form a URL gives,
+  IPv4-mapped and IPv4-compatible forms, NAT64 and 6to4-embedded addresses,
+  link-local, ULA, multicast, documentation ranges; anything unclassifiable
+  fails closed). The connection is then made to exactly the validated
+  addresses — no second DNS lookup, so DNS rebinding between validation and
+  connection cannot move it — while TLS still verifies the hostname via SNI.
+  Every redirect hop is re-resolved and re-checked, and the body is counted
+  as it streams so a feed past the size cap is cut off instead of buffered
+  whole. The ICS parser produces busy intervals: UTC and TZID times, all-day
+  events, DURATION, line unfolding, TRANSP (transparent events block
+  nothing), STATUS:CANCELLED, RRULE (DAILY with BYDAY, WEEKLY with BYDAY and
+  WKST, MONTHLY plain, plain-BYDAY and ordinal BYDAY, YEARLY, with INTERVAL,
+  COUNT, UNTIL), EXDATE, and RECURRENCE-ID overrides (a moved or cancelled
+  instance of a recurring event, attached by UID + RECURRENCE-ID even when
+  the cancelled instance omits DTSTART). COUNT counts occurrences the rule
+  actually generates — months without the 31st and non-leap Feb 29s do not
+  count — and no occurrence is emitted before DTSTART. Occurrences are
+  selected by overlap with the window, not by start time, so multi-day
+  events and instances moved into the window still show. Expansion is
+  bounded: it jumps to the window where every period yields a candidate, a
+  hard step budget (200k steps per event) stops pathological rules and marks
+  the result `approximate` instead of blocking the server. Text without a
+  VCALENDAR envelope (an HTML error page, say) is a failed read, not an
+  empty calendar. Rarely-used rule parts (BYSETPOS, weekday-of-year rules,
+  ...) fall back to the first occurrence only and mark the result
+  `approximate` — the pages say so.
+- A cached reader keyed by URL *and* parsing zone, so two organizers on one
+  feed (or one organizer who changes zone) never receive cached intervals
+  computed in another zone: good reads are reused within a configurable
+  window (a minute by default, ~10 s at the booking POST, which re-checks
+  nearly fresh because the page a guest came from can be minutes old);
+  failures are cached only 15 s so an outage shows an honest "check failed"
+  without hammering the provider.
 - Slots: `openSlots` and `isRealOpenSlot` take a busy list; a slot overlapping
   any busy interval is not offered, and the booking POST and reschedule POST
   refuse it (409) even when the page that offered it is stale.
 - Store: `organizer.calendar = { url, name, connectedAt }` with set/clear
   mutations; migrated in `normalize`; included in the organizer's own export;
-  gone with account deletion.
+  gone with account deletion. Each booking also persists the outcome of the
+  calendar check that actually ran when it was made (or last rescheduled):
+  `booking.calendarCheck = { state: "checked" | "failed" | "none", checkedAt,
+  approximate }` — so the claim travels with the booking instead of being
+  inferred from the organizer's current connection.
 - Dashboard: connect form (the address is probed — fetched and parsed — before
   it is saved, so "connected" never means "guessed"), status with the calendar
   name and last check, disconnect. The secret address is shown masked to its
@@ -60,7 +82,10 @@ access arrives, the feed source can be swapped behind the same interface.
   ran, that unusual repeat patterns may not be reflected, and that the
   organizer's calendar can still change after booking. When the feed could not
   be read, the note says the check failed and manual availability is shown —
-  never a silent pretend. Emails and .ics files carry the matching note.
+  never a silent pretend. The confirmation page speaks from the booking's own
+  recorded check; emails and .ics files carry the matching note per booking
+  (checked, could not be checked, or no connection), so connecting or
+  disconnecting later cannot rewrite what a guest was told.
 
 ## What is honestly NOT checked
 
@@ -79,12 +104,37 @@ access arrives, the feed source can be swapped behind the same interface.
 
 ## Verified
 
-- 106 automated tests pass (81 before, 25 new): parser unit tests for every
-  construct above, fetcher behavior including the private-host refusal, cache
-  semantics, and four end-to-end flows against a local feed server (connect,
-  masking, busy-slot hidden and refused, feed-down honesty, disconnect,
-  reschedule, export, deletion).
-- The parser was also run against a real Google Calendar iCal feed (the public
-  US-holidays feed, 317 events, folded lines): correct name extraction and
-  windowing; zero busy intervals is correct because that feed marks all events
-  TRANSPARENT (see context/sources.md).
+- 130 automated tests pass (81 before the calendar step, 49 for it): parser
+  unit tests for every construct above, address classification (IPv6
+  loopback and mapped literals, hex and dotted embedded IPv4, NAT64, 6to4),
+  fetch hardening (DNS-resolving-private refusal, the connection going only
+  to the validated address, the streaming size cap, redirect following,
+  HTML-response rejection), expansion correctness (weekday-only daily rules,
+  WKST-aligned intervals, month-end and leap-day COUNT, ordinals never
+  before DTSTART, the step budget), windowing (spanning occurrences, moved
+  and cancelled overrides), cache-zone separation, and end-to-end flows
+  against local feed servers (connect, masking, busy slot hidden and
+  refused, feed-down honesty, disconnect, reschedule, export, deletion, and
+  the per-booking check outcome surviving later disconnects).
+- The parser was also run against a real Google Calendar iCal feed (the
+  public US-holidays feed, 317 events, folded lines): correct name extraction
+  and windowing; zero busy intervals is correct because that feed marks all
+  events TRANSPARENT (see context/sources.md).
+
+## Prerequisites and the dev-stack test (honest status)
+
+- The post requires Steps 1–3 to be merged and verified before this work.
+  They are NOT yet merged: review could not complete on branches post-20,
+  post-21 and post-22 (three attempts), the operator was asked, and those
+  posts are paused. This branch is therefore stacked on the post-22 head
+  (036eac0), which carries the full steps 1–3 implementation; it cannot
+  rebase onto merged prerequisites that do not exist yet. The moment steps
+  1–3 merge, this branch rebases onto the result before its own merge.
+- The dev-stack booking-page test has not run yet: the dev stack deploys
+  from a pushed branch after review, not from this workspace. The planned
+  test, to exercise on the deployed preview: connect a feed that contains a
+  real busy interval inside the booking window, confirm the booking page
+  hides that slot, confirm a direct booking POST against it is refused
+  (409), and confirm the page's note states when the calendar was last
+  checked. Nothing is claimed as dev-stack-verified until that has been
+  done and recorded here.

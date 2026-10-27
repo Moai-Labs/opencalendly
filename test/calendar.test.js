@@ -8,6 +8,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const http = require("node:http");
 const calendarfeed = require("../lib/calendarfeed");
+const time = require("../lib/time");
 
 function ics(...body) {
   return ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//test//EN", ...body, "END:VCALENDAR"].join("\r\n") + "\r\n";
@@ -200,13 +201,22 @@ test("DURATION is honoured when DTEND is absent", () => {
   assert.equal(busy[0].endMs, Date.parse("2030-01-01T10:30:00Z"));
 });
 
-test("garbage input yields no busy times", () => {
-  const { busy, approximate } = calendarfeed.busyFromIcs("<html>not a calendar</html>", {
-    zone: "UTC",
-    ...window(),
-  });
-  assert.equal(busy.length, 0);
-  assert.equal(approximate, false);
+test("garbage input is rejected, not read as an empty calendar", () => {
+  // An HTML error page or any text without a VCALENDAR envelope must not be
+  // mistaken for a successfully parsed, empty calendar.
+  assert.throws(() => calendarfeed.busyFromIcs("<html>not a calendar</html>", { zone: "UTC", ...window() }), /not an iCalendar feed/);
+  assert.throws(() => calendarfeed.busyFromIcs("", { zone: "UTC", ...window() }), /not an iCalendar feed/);
+  // A valid envelope with no events is a real empty calendar.
+  const empty = calendarfeed.busyFromIcs(ics(), { zone: "UTC", ...window() });
+  assert.equal(empty.busy.length, 0);
+  assert.equal(empty.approximate, false);
+});
+
+test("a VEVENT without DTSTART gives no busy time and does not break the read", () => {
+  const text = ics(...event(["UID:20@t", "DTEND:20300101T103000Z"]), ...event(["UID:21@t", "DTSTART:20300101T100000Z", "DTEND:20300101T103000Z"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-01-02T00:00:00Z") };
+  const { busy } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.deepEqual(starts(busy), [Date.parse("2030-01-01T10:00:00Z")]);
 });
 
 test("feed URL validation", () => {
@@ -258,17 +268,14 @@ test("an http error is reported, not swallowed", async () => {
 
 test("the reader caches good reads and retries failures", async () => {
   let hits = 0;
-  const fetchImpl = async () => {
+  const readFeed = async () => {
     hits++;
     if (hits >= 3) {
-      return new Response(
-        ics(...event(["UID:y@t", "DTSTART:20300101T100000Z", "DTEND:20300101T103000Z"])),
-        { status: 200 }
-      );
+      return ics(...event(["UID:y@t", "DTSTART:20300101T100000Z", "DTEND:20300101T103000Z"]));
     }
-    return new Response("boom", { status: 500 });
+    throw new Error("boom");
   };
-  const reader = calendarfeed.createFeedReader({ allowPrivate: true, fetchImpl, errorCacheMs: 10 });
+  const reader = calendarfeed.createFeedReader({ readFeed, errorCacheMs: 10 });
   const url = "https://example.invalid/feed.ics";
   const first = await reader.read(url, 60000);
   assert.equal(first.ok, false);
@@ -289,4 +296,280 @@ test("the reader caches good reads and retries failures", async () => {
   const staleForbidden = await reader.read(url, 0); // maxAge 0 forces a refetch
   assert.equal(staleForbidden.ok, true);
   assert.equal(hits, 4);
+});
+
+// --- review round 1: address classification, fetch hardening, expansion ------
+
+test("private addresses of every shape are classified, not public", () => {
+  const privateOnes = [
+    "0.0.0.0", "10.1.2.3", "127.0.0.1", "169.254.1.1", "172.16.0.1", "172.31.255.255",
+    "192.168.1.1", "100.64.0.1", "224.0.0.1", "255.255.255.255",
+    "::", "::1", "[::1]", "fe80::1", "fe80::1%eth0", "fc00::1", "fd12:3456::1", "ff02::1",
+    "::ffff:127.0.0.1", "[::ffff:127.0.0.1]", "::ffff:7f00:1", "::ffff:10.0.0.1",
+    "64:ff9b::7f00:1", "2002:7f00:1::", "2001:db8::1", "::0.0.0.1",
+    "not-an-address", "010.1.1.1", "1.2.3", "1.2.3.4.5", "256.1.1.1",
+  ];
+  for (const ip of privateOnes) assert.equal(calendarfeed.ipIsPublic(ip), false, `${ip} must not count as public`);
+  const publicOnes = ["8.8.8.8", "172.32.0.1", "100.128.0.1", "203.0.113.9", "2606:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8", "[::ffff:808:808]"];
+  for (const ip of publicOnes) assert.equal(calendarfeed.ipIsPublic(ip), true, `${ip} must count as public`);
+});
+
+test("host resolution classifies IP literals (bracketed and mapped) and DNS answers", async () => {
+  await assert.rejects(() => calendarfeed.resolveFeedHost("127.0.0.1", {}), /not a public address/);
+  await assert.rejects(() => calendarfeed.resolveFeedHost("[::1]", {}), /not a public address/);
+  await assert.rejects(() => calendarfeed.resolveFeedHost("[::ffff:7f00:1]", {}), /not a public address/);
+  await assert.rejects(() => calendarfeed.resolveFeedHost("host.test", { lookupImpl: async () => [{ address: "127.0.0.1", family: 4 }] }), /not a public address/);
+  await assert.rejects(() => calendarfeed.resolveFeedHost("host.test", { lookupImpl: async () => [{ address: "::ffff:10.0.0.5", family: 6 }] }), /not a public address/);
+  const good = await calendarfeed.resolveFeedHost("host.test", {
+    lookupImpl: async () => [{ address: "203.0.113.9", family: 4 }, { address: "2606:4700::1111", family: 6 }],
+  });
+  assert.deepEqual(good, ["203.0.113.9", "2606:4700::1111"]);
+});
+
+test("IPv6 loopback and mapped literals are refused before any connection", async () => {
+  for (const host of ["[::1]:9", "[::ffff:127.0.0.1]:9", "[::ffff:7f00:1]:9"]) {
+    await assert.rejects(() => calendarfeed.fetchFeedText(`http://${host}/feed.ics`, {}), /not a public address/);
+  }
+});
+
+test("a DNS name resolving private addresses is refused", async () => {
+  await assert.rejects(
+    () => calendarfeed.fetchFeedText("http://internal.example/feed.ics", { lookupImpl: async () => [{ address: "127.0.0.1", family: 4 }] }),
+    /not a public address/
+  );
+});
+
+test("the connection uses the validated address; DNS cannot be rebound after validation", async () => {
+  let hits = 0;
+  let lookups = 0;
+  const server = http.createServer((req, res) => {
+    hits++; // a rebinding attack would land here
+    res.writeHead(200, { "content-type": "text/calendar" });
+    res.end(ics(...event(["UID:z@t", "DTSTART:20300101T100000Z", "DTEND:20300101T103000Z"])));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    // Validation resolves to a public address; the loopback server is where a
+    // rebinding resolver would send the actual connection instead.
+    await assert.rejects(
+      () =>
+        calendarfeed.fetchFeedText("http://rebinds.test/feed.ics", {
+          timeoutMs: 500,
+          lookupImpl: async () => {
+            lookups++;
+            return [{ address: "192.0.2.10", family: 4 }];
+          },
+        }),
+      /in time|refused|unreach|network/i
+    );
+    assert.equal(hits, 0, "nothing may connect to the private address");
+    assert.equal(lookups, 1, "DNS is resolved once, at validation; the connection reuses that answer");
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("an oversized feed is cut off while streaming, not buffered whole", async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end(Buffer.alloc(3 * 1024 * 1024, 97)); // 3 MB, past the 2 MB cap
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}/feed.ics`;
+  try {
+    await assert.rejects(() => calendarfeed.fetchFeedText(url, { allowPrivate: true }), /too large/);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("redirects are followed and every hop is fetched through the same guard", async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/one") {
+      res.writeHead(302, { location: "/two" });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/calendar" });
+    res.end(ics(...event(["UID:35@t", "DTSTART:20300101T100000Z", "DTEND:20300101T103000Z"])));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}/one`;
+  try {
+    const text = await calendarfeed.fetchFeedText(url, { allowPrivate: true });
+    assert.ok(text.includes("BEGIN:VEVENT"));
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("an HTML error page is a failed read, not an empty calendar", async () => {
+  const reader = calendarfeed.createFeedReader({ readFeed: async () => "<html><body>rate limited</body></html>" });
+  const res = await reader.read("https://example.invalid/feed.ics", 60000);
+  assert.equal(res.ok, false);
+  assert.match(res.error, /not an iCalendar feed/);
+});
+
+test("a cancelled instance without DTSTART still removes its occurrence", () => {
+  const master = event(["UID:22@t", "DTSTART:20300101T090000Z", "DTEND:20300101T093000Z", "RRULE:FREQ=DAILY;COUNT=3"]);
+  const cancelled = event(["UID:22@t", "RECURRENCE-ID:20300102T090000Z", "STATUS:CANCELLED"]);
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-01-10T00:00:00Z") };
+  const { busy } = calendarfeed.busyFromIcs(ics(...master, ...cancelled), { zone: "UTC", ...w });
+  assert.deepEqual(starts(busy), [Date.parse("2030-01-01T09:00:00Z"), Date.parse("2030-01-03T09:00:00Z")]);
+});
+
+test("an occurrence that starts before the window but is busy inside it is not lost", () => {
+  // A weekly event, 48 hours long: its Tuesday occurrence spans into
+  // Wednesday and must still block Wednesday's hours, even though it started
+  // before the window.
+  const text = ics(...event(["UID:23@t", "DTSTART:20300101T100000Z", "DTEND:20300103T100000Z", "RRULE:FREQ=WEEKLY"]));
+  const w = { fromMs: Date.parse("2030-01-02T00:00:00Z"), toMs: Date.parse("2030-01-04T00:00:00Z") };
+  const { busy } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.deepEqual(starts(busy), [Date.parse("2030-01-01T10:00:00Z")]);
+});
+
+test("an instance moved into the window from an occurrence outside it is kept", () => {
+  const master = event(["UID:24@t", "DTSTART:20300101T090000Z", "DTEND:20300101T093000Z", "RRULE:FREQ=DAILY"]);
+  const moved = event(["UID:24@t", "RECURRENCE-ID:20300101T090000Z", "DTSTART:20300105T140000Z", "DTEND:20300105T143000Z"]);
+  // The window starts Jan 4: the overridden occurrence was Jan 1, never
+  // enumerated inside the window, yet its moved time must still appear.
+  const w = { fromMs: Date.parse("2030-01-04T00:00:00Z"), toMs: Date.parse("2030-01-07T00:00:00Z") };
+  const { busy } = calendarfeed.busyFromIcs(ics(...master, ...moved), { zone: "UTC", ...w });
+  assert.deepEqual(starts(busy), [
+    Date.parse("2030-01-04T09:00:00Z"),
+    Date.parse("2030-01-05T09:00:00Z"),
+    Date.parse("2030-01-05T14:00:00Z"),
+    Date.parse("2030-01-06T09:00:00Z"),
+  ]);
+});
+
+test("a weekday-only daily rule lands only on those weekdays and counts real occurrences", () => {
+  // 2030-01-01 is a Tuesday: MO,WE gives Wed 2nd, Mon 7th, Wed 9th for COUNT=3.
+  const text = ics(...event(["UID:25@t", "DTSTART:20300101T090000Z", "DTEND:20300101T093000Z", "RRULE:FREQ=DAILY;BYDAY=MO,WE;COUNT=3"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-01-15T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, false);
+  assert.deepEqual(starts(busy), [
+    Date.parse("2030-01-02T09:00:00Z"),
+    Date.parse("2030-01-07T09:00:00Z"),
+    Date.parse("2030-01-09T09:00:00Z"),
+  ]);
+});
+
+test("WKST decides which weeks an interval-aligned weekly rule skips", () => {
+  // DTSTART Monday 2030-01-07. With weeks starting Sunday (WKST=SU), the
+  // Sunday of DTSTART's week is Jan 6, before DTSTART; the interval-2 weeks
+  // then produce Sundays Jan 20 and Feb 3 — not Jan 13 and Jan 27, which a
+  // Monday-anchored week would give.
+  const text = ics(...event(["UID:26@t", "DTSTART:20300107T090000Z", "DTEND:20300107T093000Z", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,SU;WKST=SU"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-02-10T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, false);
+  assert.deepEqual(starts(busy), [
+    Date.parse("2030-01-07T09:00:00Z"),
+    Date.parse("2030-01-20T09:00:00Z"),
+    Date.parse("2030-01-21T09:00:00Z"),
+    Date.parse("2030-02-03T09:00:00Z"),
+    Date.parse("2030-02-04T09:00:00Z"),
+  ]);
+});
+
+test("a month-end rule with COUNT counts real occurrences, not elapsed months", () => {
+  // From Jan 31 monthly, February has no 31st; COUNT=3 must count the dates
+  // that exist, reaching May 31 — not stop at March.
+  const text = ics(...event(["UID:27@t", "DTSTART:20300131T090000Z", "DTEND:20300131T093000Z", "RRULE:FREQ=MONTHLY;COUNT=3"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-08-01T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, false);
+  assert.deepEqual(starts(busy), [
+    Date.parse("2030-01-31T09:00:00Z"),
+    Date.parse("2030-03-31T09:00:00Z"),
+    Date.parse("2030-05-31T09:00:00Z"),
+  ]);
+});
+
+test("a leap-day rule with COUNT counts real occurrences, not elapsed years", () => {
+  // COUNT=3 from 2024-02-29 yearly reaches 2032; counting elapsed years
+  // would stop at 2030 and yield only two occurrences.
+  const text = ics(...event(["UID:28@t", "DTSTART:20240229T090000Z", "DTEND:20240229T093000Z", "RRULE:FREQ=YEARLY;COUNT=3"]));
+  const w = { fromMs: Date.parse("2024-01-01T00:00:00Z"), toMs: Date.parse("2034-01-01T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, false);
+  assert.deepEqual(starts(busy), [
+    Date.parse("2024-02-29T09:00:00Z"),
+    Date.parse("2028-02-29T09:00:00Z"),
+    Date.parse("2032-02-29T09:00:00Z"),
+  ]);
+});
+
+test("a monthly rule on a plain weekday hits every such day of the month", () => {
+  // FREQ=MONTHLY;BYDAY=MO means every Monday, not just the DTSTART weekday.
+  const text = ics(...event(["UID:31@t", "DTSTART:20300107T090000Z", "DTEND:20300107T093000Z", "RRULE:FREQ=MONTHLY;BYDAY=MO"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-02-01T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, false);
+  assert.deepEqual(starts(busy), [
+    Date.parse("2030-01-07T09:00:00Z"),
+    Date.parse("2030-01-14T09:00:00Z"),
+    Date.parse("2030-01-21T09:00:00Z"),
+    Date.parse("2030-01-28T09:00:00Z"),
+  ]);
+});
+
+test("monthly ordinal expansion never emits a date before DTSTART", () => {
+  // First Monday of each month from Jan 20: January's first Monday (Jan 7)
+  // lies before DTSTART and must not appear.
+  const text = ics(...event(["UID:29@t", "DTSTART:20300120T090000Z", "DTEND:20300120T093000Z", "RRULE:FREQ=MONTHLY;BYDAY=1MO"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2030-03-01T00:00:00Z") };
+  const { busy } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.deepEqual(starts(busy), [Date.parse("2030-02-04T09:00:00Z")]);
+});
+
+test("a yearly weekday rule is marked approximate and keeps its first occurrence", () => {
+  const text = ics(...event(["UID:30@t", "DTSTART:20300101T090000Z", "DTEND:20300101T093000Z", "RRULE:FREQ=YEARLY;BYDAY=MO"]));
+  const w = { fromMs: Date.parse("2030-01-01T00:00:00Z"), toMs: Date.parse("2032-01-01T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, true);
+  assert.deepEqual(starts(busy), [Date.parse("2030-01-01T09:00:00Z")]);
+});
+
+test("a pathological rule is cut off by the step budget and marked approximate", () => {
+  // A daily rule from the year 1000 with an absurd COUNT would walk hundreds
+  // of thousands of days; the step budget must stop it and own up.
+  const text = ics(...event(["UID:34@t", "DTSTART:10000101T090000Z", "DTEND:10000101T093000Z", "RRULE:FREQ=DAILY;COUNT=999999999"]));
+  const started = Date.now();
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...window() });
+  // The budget stops the walk before it reaches the window: the honest
+  // answer is "approximate", reported quickly, with whatever was derived.
+  assert.equal(approximate, true);
+  assert.ok(Date.now() - started < 2000, "expansion must not monopolize the server");
+});
+
+test("a daily rule from years back with no COUNT jumps to the window cheaply", () => {
+  const text = ics(...event(["UID:33@t", "DTSTART:20000101T090000Z", "DTEND:20000101T093000Z", "RRULE:FREQ=DAILY"]));
+  const started = Date.now();
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...window() });
+  assert.equal(approximate, false);
+  assert.ok(busy.length >= 1);
+  assert.ok(Date.now() - started < 500, "a 26-year-old daily rule must not walk day by day");
+});
+
+test("the same feed read in two zones gets zone-correct intervals, not a shared cache", async () => {
+  let hits = 0;
+  const readFeed = async () => {
+    hits++;
+    const dateStr = time.localDate("UTC", Date.now() + 5 * 86400000);
+    return ics(...event(["UID:32@t", `DTSTART;VALUE=DATE:${dateStr.replace(/-/g, "")}`]));
+  };
+  const reader = calendarfeed.createFeedReader({ readFeed });
+  const url = "https://example.invalid/feed.ics";
+  const first = await reader.read(url, 60000, { zone: "UTC" });
+  const second = await reader.read(url, 60000, { zone: "Pacific/Kiritimati" }); // UTC+14, read inside the cache lifetime
+  const third = await reader.read(url, 60000, { zone: "UTC" });
+  assert.equal(hits, 2, "one fetch per zone, not one per URL");
+  assert.notEqual(first.busy[0].startMs, second.busy[0].startMs, "an all-day event must start at that zone's midnight");
+  const dateStr = time.localDate("UTC", Date.now() + 5 * 86400000);
+  assert.equal(first.busy[0].startMs, time.wallMinutesToUtcMs("UTC", dateStr, 0));
+  assert.equal(second.busy[0].startMs, time.wallMinutesToUtcMs("Pacific/Kiritimati", dateStr, 0));
+  assert.equal(third.busy[0].startMs, first.busy[0].startMs);
 });

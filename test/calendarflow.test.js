@@ -312,3 +312,77 @@ test("export carries the connection; deletion removes it", async () => {
     await ctx.close();
   }
 });
+
+test("the recorded check outcome follows the booking, not the current connection", async () => {
+  const ctx = await start({ feedRecheckMs: 200 }); // the booking POST re-check must see the broken feed quickly
+  const feed = feedServer(icsFor(weekdayAhead()));
+  const feedUrl = await feed.listen();
+  try {
+    const { cookie } = await signup(ctx, { slug: "truth" });
+    const organizer = () => ctx.store.state.organizers.find((o) => o.email.endsWith("@example.com"));
+
+    // Connect while the feed is readable, then break it.
+    const nineMs = time.wallMinutesToUtcMs("UTC", weekdayAhead(), 540);
+    const connected = await post(`${ctx.base}/dashboard/calendar`, { url: feedUrl }, { cookie });
+    assert.equal(connected.status, 303);
+
+    // Booked while the feed was down: files and emails must say the check
+    // failed, never that times were checked.
+    feed.set(icsFor(weekdayAhead()), 503);
+    await new Promise((r) => setTimeout(r, 250)); // past the booking re-check window
+    const down = await post(`${ctx.base}/b/${organizer().slug}/book`, {
+      start: new Date(nineMs).toISOString(),
+      tz: "UTC",
+      guest_name: "Dana",
+      guest_email: "dana@example.com",
+    });
+    assert.equal(down.status, 303);
+    const downId = new URL(down.headers.get("location"), ctx.base).pathname.split("/").pop();
+    const downIcs = (await (await get(ctx, `${ctx.base}/cal/${downId}.ics`)).text()).replace(/\r\n /g, "");
+    assert.match(downIcs, /could not be checked/);
+
+    // Booked while the feed was readable: the check that ran is on record.
+    feed.set(icsFor(weekdayAhead()), 200);
+    await new Promise((r) => setTimeout(r, 250)); // past the 200 ms cache window
+    const up = await post(`${ctx.base}/b/${organizer().slug}/book`, {
+      start: new Date(nineMs + 30 * 60000).toISOString(), // 09:30, outside the feed's 10:00 block
+      tz: "UTC",
+      guest_name: "Evan",
+      guest_email: "evan@example.com",
+    });
+    assert.equal(up.status, 303);
+    const upId = new URL(up.headers.get("location"), ctx.base).pathname.split("/").pop();
+    const upIcs = (await (await get(ctx, `${ctx.base}/cal/${upId}.ics`)).text()).replace(/\r\n /g, "");
+    assert.match(upIcs, /times were checked against the organizer's external calendar/);
+
+    // Disconnecting later cannot rewrite history: Dana's file still says the
+    // check failed, Evan's still says it ran.
+    await post(`${ctx.base}/dashboard/calendar/disconnect`, {}, { cookie });
+    assert.equal(organizer().calendar, null);
+    assert.match((await (await get(ctx, `${ctx.base}/cal/${downId}.ics`)).text()).replace(/\r\n /g, ""), /could not be checked/);
+    assert.match((await (await get(ctx, `${ctx.base}/cal/${upId}.ics`)).text()).replace(/\r\n /g, ""), /times were checked against the organizer's external calendar/);
+
+    // A booking made with no connection says so.
+    const later = await post(`${ctx.base}/b/${organizer().slug}/book`, {
+      start: new Date(nineMs + 60 * 60000).toISOString(), // 10:00? no: 09:00+60min; free slot after disconnect
+      tz: "UTC",
+      guest_name: "Fay",
+      guest_email: "fay@example.com",
+    });
+    assert.equal(later.status, 303);
+    const laterId = new URL(later.headers.get("location"), ctx.base).pathname.split("/").pop();
+    assert.match((await (await get(ctx, `${ctx.base}/cal/${laterId}.ics`)).text()).replace(/\r\n /g, ""), /does not check the organizer's external calendars/);
+
+    // A reschedule records the check it actually ran: with no connection, the
+    // booking's claim becomes "not checked" for the new time.
+    const resched = await post(`${ctx.base}/b/${organizer().slug}/reschedule/${upId}`, {
+      start: new Date(nineMs + 90 * 60000).toISOString(),
+      tz: "UTC",
+    });
+    assert.equal(resched.status, 303);
+    assert.match((await (await get(ctx, `${ctx.base}/cal/${upId}.ics`)).text()).replace(/\r\n /g, ""), /does not check the organizer's external calendars/);
+  } finally {
+    await feed.close();
+    await ctx.close();
+  }
+});

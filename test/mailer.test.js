@@ -189,3 +189,17 @@ test("CR/LF in names, event titles and addresses cannot inject headers or termin
 
   server.close();
 });
+
+test("the confirmation note reflects the check outcome recorded on the booking", () => {
+  const mk = (calendarCheck) =>
+    buildGuestConfirmation({
+      organizer: { id: "org1", name: "Ada", timezone: "UTC", email: "ada@example.com", calendar: { url: "https://f.example/x" } },
+      booking: { id: "b1", startMs: Date.UTC(2026, 10, 3, 14, 0), guestName: "Grace", guestEmail: "grace@example.com", calendarCheck },
+      baseUrl: "http://localhost:3000",
+      guestZone: "UTC",
+    }).text;
+  assert.ok(mk({ state: "checked", checkedAt: Date.now(), approximate: false }).includes("times were checked against the organizer's external calendar"));
+  assert.ok(mk({ state: "failed", checkedAt: Date.now() }).includes("could not be checked"));
+  assert.ok(mk({ state: "none", checkedAt: null }).includes("does not check the organizer's external calendars"));
+  assert.ok(mk(null).includes("does not check the organizer's external calendars"));
+});
