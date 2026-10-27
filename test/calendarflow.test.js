@@ -313,8 +313,7 @@ test("export carries the connection; deletion removes it", async () => {
   }
 });
 
-test("the recorded check outcome follows the booking, not the current connection", async () => {
-  const ctx = await start({ feedRecheckMs: 200 }); // the booking POST re-check must see the broken feed quickly
+test("the recorded check outcome follows the booking, not the current connection", async () => {  const ctx = await start({ feedRecheckMs: 200 }); // the booking POST re-check must see the broken feed quickly
   const feed = feedServer(icsFor(weekdayAhead()));
   const feedUrl = await feed.listen();
   try {
@@ -381,6 +380,69 @@ test("the recorded check outcome follows the booking, not the current connection
     });
     assert.equal(resched.status, 303);
     assert.match((await (await get(ctx, `${ctx.base}/cal/${upId}.ics`)).text()).replace(/\r\n /g, ""), /does not check the organizer's external calendars/);
+  } finally {
+    await feed.close();
+    await ctx.close();
+  }
+});
+
+test("an incomplete check says so in the note, and the claim follows the booking", async () => {
+  const ctx = await start();
+  // An RRULE with BYSETPOS is a pattern the parser keeps only its first
+  // occurrence of: the check runs but is marked approximate.
+  const feed = feedServer(
+    [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//test//EN",
+      "BEGIN:VEVENT",
+      "UID:approx@t",
+      `DTSTART:${weekdayAhead().replace(/-/g, "")}T100000Z`,
+      `DTEND:${weekdayAhead().replace(/-/g, "")}T103000Z`,
+      "RRULE:FREQ=DAILY;BYSETPOS=1;COUNT=5",
+      "SUMMARY:Odd pattern",
+      "END:VEVENT",
+      "END:VCALENDAR",
+      "",
+    ].join("\r\n")
+  );
+  const feedUrl = await feed.listen();
+  try {
+    const { cookie } = await signup(ctx, { slug: "approx" });
+    const organizer = () => ctx.store.state.organizers.find((o) => o.email.endsWith("@example.com"));
+    const connected = await post(`${ctx.base}/dashboard/calendar`, { url: feedUrl }, { cookie });
+    assert.equal(connected.status, 303);
+    assert.equal(organizer().calendar.url, feedUrl);
+
+    // The public page discloses the incomplete check.
+    const page = await get(ctx, `${ctx.base}/b/${organizer().slug}?date=${weekdayAhead()}`);
+    const pageHtml = await page.text();
+    assert.match(pageHtml, /Unusual repeat patterns in that calendar may not be reflected/);
+
+    // A booking made under it records the incomplete check and every
+    // guest-facing artefact says so.
+    const nineMs = time.wallMinutesToUtcMs("UTC", weekdayAhead(), 540);
+    const booked = await post(`${ctx.base}/b/${organizer().slug}/book`, {
+      start: new Date(nineMs).toISOString(),
+      tz: "UTC",
+      guest_name: "Ida",
+      guest_email: "ida@example.com",
+    });
+    assert.equal(booked.status, 303);
+    const bookingId = new URL(booked.headers.get("location"), ctx.base).pathname.split("/").pop();
+    const ics = (await (await get(ctx, `${ctx.base}/cal/${bookingId}.ics`)).text()).replace(/\r\n /g, "");
+    assert.match(ics, /times were checked against the organizer's external calendar/);
+    assert.match(ics, /The check was incomplete/);
+
+    // The confirmation email queued for the guest carries the same warning.
+    const queued = ctx.store.state.outbox.find((m) => m.to === "ida@example.com");
+    assert.ok(queued, "the guest confirmation is queued even without SMTP");
+    assert.match(queued.text, /The check was incomplete/);
+
+    // Disconnecting later cannot rewrite the warning.
+    await post(`${ctx.base}/dashboard/calendar/disconnect`, {}, { cookie });
+    const afterIcs = (await (await get(ctx, `${ctx.base}/cal/${bookingId}.ics`)).text()).replace(/\r\n /g, "");
+    assert.match(afterIcs, /The check was incomplete/);
   } finally {
     await feed.close();
     await ctx.close();

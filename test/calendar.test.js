@@ -428,6 +428,18 @@ test("an occurrence that starts before the window but is busy inside it is not l
   assert.deepEqual(starts(busy), [Date.parse("2030-01-01T10:00:00Z")]);
 });
 
+test("a recurring multi-day event starting far before the window still blocks it", () => {
+  // A weekly 5-day occurrence beginning Sunday 2030-01-06. The window opens
+  // Jan 9 — more than two days after the occurrence's start — yet the
+  // occurrence is still busy Jan 9–10 and must be enumerated; a fixed
+  // two-day lookback would miss it.
+  const text = ics(...event(["UID:23b@t", "DTSTART:20300106T100000Z", "DTEND:20300111T100000Z", "RRULE:FREQ=WEEKLY"]));
+  const w = { fromMs: Date.parse("2030-01-09T00:00:00Z"), toMs: Date.parse("2030-01-12T00:00:00Z") };
+  const { busy } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.deepEqual(starts(busy), [Date.parse("2030-01-06T10:00:00Z")]);
+  assert.equal(busy[0].endMs, Date.parse("2030-01-11T10:00:00Z"));
+});
+
 test("an instance moved into the window from an occurrence outside it is kept", () => {
   const master = event(["UID:24@t", "DTSTART:20300101T090000Z", "DTEND:20300101T093000Z", "RRULE:FREQ=DAILY"]);
   const moved = event(["UID:24@t", "RECURRENCE-ID:20300101T090000Z", "DTSTART:20300105T140000Z", "DTEND:20300105T143000Z"]);
@@ -472,6 +484,19 @@ test("WKST decides which weeks an interval-aligned weekly rule skips", () => {
     Date.parse("2030-02-03T09:00:00Z"),
     Date.parse("2030-02-04T09:00:00Z"),
   ]);
+});
+
+test("weekly candidates are ordered by WKST, so COUNT=1 picks Sunday over Monday", () => {
+  // DTSTART Sunday 2030-01-06, WKST=SU, BYDAY=SU,MO, COUNT=1. Sunday sits at
+  // offset 0 of a Sunday-anchored week and must be the one occurrence COUNT
+  // keeps; Monday would be picked if candidates were ordered by weekday
+  // number. The horizon also ends between Sunday and Monday, so the walk
+  // must stop cleanly there without first emitting Monday.
+  const text = ics(...event(["UID:26b@t", "DTSTART:20300106T090000Z", "DTEND:20300106T093000Z", "RRULE:FREQ=WEEKLY;BYDAY=SU,MO;WKST=SU;COUNT=1"]));
+  const w = { fromMs: Date.parse("2030-01-05T00:00:00Z"), toMs: Date.parse("2030-01-07T00:00:00Z") };
+  const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...w });
+  assert.equal(approximate, false);
+  assert.deepEqual(starts(busy), [Date.parse("2030-01-06T09:00:00Z")]);
 });
 
 test("a month-end rule with COUNT counts real occurrences, not elapsed months", () => {
@@ -534,15 +559,33 @@ test("a yearly weekday rule is marked approximate and keeps its first occurrence
 });
 
 test("a pathological rule is cut off by the step budget and marked approximate", () => {
-  // A daily rule from the year 1000 with an absurd COUNT would walk hundreds
-  // of thousands of days; the step budget must stop it and own up.
-  const text = ics(...event(["UID:34@t", "DTSTART:10000101T090000Z", "DTEND:10000101T093000Z", "RRULE:FREQ=DAILY;COUNT=999999999"]));
+  // A daily rule with named weekdays cannot be fast-forwarded (the skipped
+  // days make the occurrence index unpredictable), so from the year 1000 it
+  // would walk hundreds of thousands of days; the step budget must stop it
+  // and own up.
+  const text = ics(...event(["UID:34@t", "DTSTART:10000101T090000Z", "DTEND:10000101T093000Z", "RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR;COUNT=999999999"]));
   const started = Date.now();
   const { busy, approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...window() });
   // The budget stops the walk before it reaches the window: the honest
   // answer is "approximate", reported quickly, with whatever was derived.
   assert.equal(approximate, true);
   assert.ok(Date.now() - started < 2000, "expansion must not monopolize the server");
+});
+
+test("many old recurring events share one feed-wide budget and cannot each re-spend it", () => {
+  // Forty daily rules from the year 1000: a per-event allowance would let
+  // each walk 200,000 steps (eight million in all). The feed-wide budget
+  // stops the parse long before that, marks the result approximate, and
+  // returns quickly.
+  const events = [];
+  for (let i = 0; i < 40; i++) {
+    events.push(...event([`UID:feed-${i}@t`, "DTSTART:10000101T090000Z", "DTEND:10000101T093000Z", "RRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR"]));
+  }
+  const text = ics(...events);
+  const started = Date.now();
+  const { approximate } = calendarfeed.busyFromIcs(text, { zone: "UTC", ...window() });
+  assert.equal(approximate, true);
+  assert.ok(Date.now() - started < 2000, "the feed budget must bound the whole parse");
 });
 
 test("a daily rule from years back with no COUNT jumps to the window cheaply", () => {

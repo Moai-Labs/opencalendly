@@ -6,7 +6,7 @@ const net = require("node:net");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { Mailer, buildGuestConfirmation } = require("../lib/mailer");
+const { Mailer, buildGuestConfirmation, buildGuestRescheduled, buildOrganizerRescheduled } = require("../lib/mailer");
 const { Store } = require("../lib/store");
 
 // A deliberately tiny SMTP server: enough protocol to exercise our client.
@@ -202,4 +202,34 @@ test("the confirmation note reflects the check outcome recorded on the booking",
   assert.ok(mk({ state: "failed", checkedAt: Date.now() }).includes("could not be checked"));
   assert.ok(mk({ state: "none", checkedAt: null }).includes("does not check the organizer's external calendars"));
   assert.ok(mk(null).includes("does not check the organizer's external calendars"));
+});
+
+test("an incomplete check says so in the confirmation and reschedule notes", () => {
+  // approximate: the check ran but could not expand every recurrence pattern,
+  // so "checked" alone would claim more than happened.
+  const approximate = { state: "checked", checkedAt: Date.now(), approximate: true };
+  const confirmed = buildGuestConfirmation({
+    organizer: { id: "org1", name: "Ada", timezone: "UTC", email: "ada@example.com", calendar: { url: "https://f.example/x" } },
+    booking: { id: "b1", startMs: Date.UTC(2026, 10, 3, 14, 0), guestName: "Grace", guestEmail: "grace@example.com", calendarCheck: approximate },
+    baseUrl: "http://localhost:3000",
+    guestZone: "UTC",
+  }).text;
+  assert.ok(confirmed.includes("times were checked against the organizer's external calendar"));
+  assert.ok(confirmed.includes("The check was incomplete"));
+
+  const guestRescheduled = buildGuestRescheduled({
+    organizer: { id: "org1", name: "Ada", timezone: "UTC", email: "ada@example.com", slug: "ada" },
+    booking: { id: "b1", startMs: Date.UTC(2026, 10, 3, 14, 0), guestName: "Grace", guestEmail: "grace@example.com", calendarCheck: approximate },
+    baseUrl: "http://localhost:3000",
+    guestZone: "UTC",
+  }).text;
+  assert.ok(guestRescheduled.includes("The check was incomplete"));
+
+  const organizerRescheduled = buildOrganizerRescheduled({
+    organizer: { id: "org1", name: "Ada", timezone: "UTC", email: "ada@example.com", slug: "ada" },
+    booking: { id: "b1", startMs: Date.UTC(2026, 10, 3, 14, 0), guestName: "Grace", guestEmail: "grace@example.com", calendarCheck: approximate },
+    baseUrl: "http://localhost:3000",
+    guestZone: "UTC",
+  }).text;
+  assert.ok(organizerRescheduled.includes("The check was incomplete"));
 });
