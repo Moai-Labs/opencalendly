@@ -306,3 +306,86 @@ test("deleting an organizer removes their data and anonymizes their bookings", a
 
   assert.strictEqual((await store.deleteOrganizer("no-such-id")).code, "not_found");
 });
+
+test("a state file that cannot be read stops startup instead of being replaced", async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ organizers: [1], bookings: [], outbox: [] }));
+  // Make the existing file unreadable in a way readFileSync cannot ignore:
+  // the path now holds a directory, so the read fails with EISDIR — neither
+  // ENOENT nor a corrupt file, but a read error.
+  fs.rmSync(path.join(dir, "state.json"));
+  fs.mkdirSync(path.join(dir, "state.json"));
+  fs.writeFileSync(path.join(dir, "state.json", "keep"), "precious");
+  const store = new Store(dir);
+  assert.throws(
+    () => store.init(),
+    (err) => err.code === "EISDIR",
+    "init refuses to start on a read error"
+  );
+  assert.ok(fs.existsSync(path.join(dir, "state.json", "keep")), "the unreadable path was not touched");
+  assert.ok(!fs.existsSync(path.join(dir, "state.json.tmp")), "no empty state was written over it");
+  assert.strictEqual(store.state, null);
+});
+
+test("a corrupt state file is moved aside, not overwritten", async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "state.json"), "{not json");
+  const store = new Store(dir).init();
+  assert.strictEqual(store.state.organizers.length, 0);
+  const backup = fs.readdirSync(dir).find((f) => f.startsWith("state.json.corrupt-"));
+  assert.ok(backup, "the corrupt file was preserved for recovery");
+  assert.ok(fs.readFileSync(path.join(dir, backup), "utf8").includes("not json"));
+});
+
+test("deleting an event type keeps the bookings that referenced it intact", async () => {
+  const dir = tmpDir();
+  const store = new Store(dir).init();
+  const org = await store.createOrganizer({
+    name: "Ada", email: "ada@example.com", passwordHash: "h", salt: "s",
+    slug: "ada123", timezone: "UTC",
+    event: { name: "Intro call", durationMinutes: 30, availability: {} },
+  });
+  const organizerId = org.organizer.id;
+  await store.updateOrganizer(organizerId, { paidUntil: Date.now() + 86400000 }); // paid: 3 types allowed
+  const second = await store.addEventType(organizerId, { name: "Long session", durationMinutes: 60 });
+  assert.ok(second.ok);
+  const booked = await store.createBooking({
+    organizerId,
+    eventTypeId: second.eventType.id,
+    event: second.eventType,
+    startMs: Date.UTC(2026, 10, 3, 9, 0),
+    endMs: Date.UTC(2026, 10, 3, 10, 0),
+    guestName: "Grace", guestEmail: "grace@example.com",
+  });
+  assert.ok(booked.ok);
+  const removed = await store.deleteEventType(organizerId, second.eventType.id);
+  assert.ok(removed.ok);
+  // The booking keeps the event it was made for, even though the type is gone.
+  assert.strictEqual(store.findBooking(booked.booking.id).eventType.name, "Long session");
+  assert.strictEqual(store.findBooking(booked.booking.id).eventType.durationMinutes, 60);
+});
+
+test("the event-type limit is enforced inside the locked mutation, not only in the route", async () => {
+  const dir = tmpDir();
+  const store = new Store(dir).init();
+  const org = await store.createOrganizer({
+    name: "Ada", email: "ada@example.com", passwordHash: "h", salt: "s",
+    slug: "ada123", timezone: "UTC",
+    event: { name: "30 minute meeting", durationMinutes: 30, availability: {} },
+  });
+  const organizerId = org.organizer.id;
+  // Free tier, already at one type: the store itself refuses.
+  const denied = await store.addEventType(organizerId, { name: "Second", durationMinutes: 30 });
+  assert.strictEqual(denied.ok, false);
+  assert.strictEqual(denied.code, "limit_reached");
+  // Paid: two additions race; exactly the ones that fit under three succeed.
+  await store.updateOrganizer(organizerId, { paidUntil: Date.now() + 86400000 });
+  const race = await Promise.all([
+    store.addEventType(organizerId, { name: "Second", durationMinutes: 30 }),
+    store.addEventType(organizerId, { name: "Third", durationMinutes: 30 }),
+    store.addEventType(organizerId, { name: "Fourth", durationMinutes: 30 }),
+  ]);
+  assert.strictEqual(race.filter((r) => r.ok).length, 2, "exactly two of the three fit under the paid limit");
+  assert.strictEqual(store.state.organizers[0].eventTypes.length, 3);
+  assert.strictEqual(store.state.organizers[0].eventTypes.map((t) => t.name).includes("Fourth"), false);
+});

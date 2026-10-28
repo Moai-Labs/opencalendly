@@ -199,7 +199,7 @@ test("each booking has a calendar file with UTC times and the honest note", asyn
   assert.match(ics, /^BEGIN:VCALENDAR\r\n/m);
   assert.match(ics, /DTSTART:\d{8}T\d{6}Z/);
   assert.match(ics, new RegExp(`DTSTART:${startIso.replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}`));
-  assert.match(ics, /external calendars are not checked/);
+  assert.match(ics, /does not check the organizer's external calendars/);
   assert.match(ics, /UID:[0-9a-f]+@opencalendly/);
 });
 
