@@ -52,3 +52,16 @@ payments. The outbox and event model were shaped to make those additions easy.
 - The SMTP STARTTLS path is tested against a fake server, not a real relay.
 - Session cookies are HMAC-signed with a secret in the store; sessions survive restarts.
   No CSRF token yet — SameSite=Lax only.
+
+## Status 2026-10-28 (post-20 session 2)
+
+- Branch `post-20` is unchanged at a1ca839; that commit is already an ancestor of
+  `main` (carried in by the post-31 merge b6e79ae), so the code on the dev stack
+  includes this step. CI holds a pass verdict for b6e79ae.
+- Re-verified this session: 40/40 tests on the branch, 137/137 on merged main.
+- The earlier pause was review infrastructure (3 failed review attempts), not a
+  content finding. After the platform re-took the post up, the push is queued
+  awaiting code review again; nothing was re-pushed, so the review scope stays
+  the booking core alone rather than a merge of the later steps.
+- App preview URL is not reachable from the workspace (fly.dev does not resolve
+  here); the platform's dev preview link is the one it posts with verification.
