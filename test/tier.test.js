@@ -449,6 +449,55 @@ test("deleting an event type never rewrites the bookings that reference it", asy
   await ctx.close();
 });
 
+test("tier expiry pauses a type for new bookings but never holds a guest's own booking hostage", async () => {
+  const ctx = await start();
+  const org = await signup(ctx, "Life");
+  await payFor30Days(ctx, org);
+  await post(`${ctx.base}/event-types`, typeFields("Second type"), { cookie: org.cookie });
+  const secondId = ctx.store.state.organizers[0].eventTypes[1].id;
+
+  // A guest books the (then paid-only) second type.
+  const typePage = await (await fetch(`${ctx.base}/b/${org.slug}?e=${secondId}`)).text();
+  const newUrl = typePage.match(/href="(\/b\/[a-z0-9]+\/new\?start=[^"]+)"/)[1];
+  const formPage = await (await fetch(`${ctx.base}${newUrl}`)).text();
+  const startIso = formPage.match(/name="start" value="([^"]+)"/)[1];
+  const bookRes = await post(`${ctx.base}/b/${org.slug}/book`, {
+    start: startIso, tz: "UTC", e: secondId, guest_name: "Gwen", guest_email: "gwen@example.com",
+  });
+  assert.strictEqual(bookRes.status, 303);
+  const booking = ctx.store.state.bookings[0];
+
+  // The grant expires. The type is paused for new bookings...
+  ctx.store.state.organizers[0].paidUntil = Date.now() - 1000;
+  const smuggled = await post(`${ctx.base}/b/${org.slug}/book`, {
+    start: startIso, tz: "UTC", e: secondId, guest_name: "Sid", guest_email: "sid@example.com",
+  });
+  assert.strictEqual(smuggled.status, 404, "expiry still refuses new bookings on the paused type");
+
+  // ...but Step 2's guest lifecycle keeps working on the booking that exists:
+  // rescheduling moves it, and cancelling ends it. Expiry must not strand a
+  // guest with a booking they can neither move nor leave.
+  const reschedulePage = await (await fetch(`${ctx.base}/b/${org.slug}/reschedule/${booking.id}`)).text();
+  assert.strictEqual(
+    (await fetch(`${ctx.base}/b/${org.slug}/reschedule/${booking.id}`)).status,
+    200,
+    "the reschedule page still renders for a paused type's booking"
+  );
+  assert.ok(reschedulePage.includes("Second type"), "the reschedule page keeps the booked event's name");
+  const moved = Date.parse(startIso) + 30 * 60000; // the next slot in the same window
+  const rescheduled = await post(`${ctx.base}/b/${org.slug}/reschedule/${booking.id}`, {
+    start: new Date(moved).toISOString(), tz: "UTC",
+  });
+  assert.strictEqual(rescheduled.status, 303, "the guest can still reschedule a paused type's booking");
+  assert.strictEqual(ctx.store.state.bookings[0].startMs, moved);
+
+  const cancelled = await post(`${ctx.base}/b/${org.slug}/cancel/${booking.id}`, {});
+  assert.strictEqual(cancelled.status, 303, "the guest can still cancel a paused type's booking");
+  assert.strictEqual(ctx.store.state.bookings[0].status, "cancelled");
+  assert.strictEqual(ctx.store.state.bookings.filter((b) => b.status !== "cancelled").length, 0);
+  await ctx.close();
+});
+
 test("a malformed path is a 400 and the server lives on", async () => {
   const ctx = await start();
   const bad = await fetch(`${ctx.base}/b/%ZZ`, { redirect: "manual" });
