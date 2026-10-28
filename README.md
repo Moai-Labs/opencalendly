@@ -16,11 +16,21 @@ the people who hold its token.
   mail server (SMTP_HOST env) emails queue in the organizer's dashboard instead of being
   silently dropped; with one, a minimal built-in SMTP client sends them.
 - An .ics calendar file for every booking.
+- Read access to one external calendar per organizer: paste your calendar's secret iCal
+  address (Google Calendar → Settings → your calendar → "Secret address in iCal format")
+  and the booking page hides the times that calendar shows busy. The feed is fetched
+  read-only, cached briefly, and every page states when it was last checked. The address
+  is stored but never shown in full again.
 - All data persists in one JSON file written atomically on every change, and is restored on
   restart; the startup reads it before serving.
 
-Honest limitation, shown in the product itself: external calendars are not checked. A slot
-can be open here even if your own calendar shows you busy.
+Honest boundaries of the external-calendar check, shown in the product itself: the check
+runs when a page is served (results up to a minute old, and the booking itself is
+re-checked nearly fresh, but the organizer's calendar can change right after); unusual
+repeat patterns in the feed keep only their first occurrence, and the page says so; if
+the feed cannot be read, the page says so and shows manual availability. Organizers
+without a connected calendar still get the plain note that external calendars are not
+checked.
 
 ## How it runs
 
@@ -38,5 +48,6 @@ can be open here even if your own calendar shows you busy.
 
 - No runtime dependencies: Node 22 standard library only. `npm test` runs the suite
   (time-zone maths, slot generation, storage restore, double-booking races, the full
-  HTTP flow, and the SMTP client against a fake server).
+  HTTP flow, the SMTP client against a fake server, and the calendar feed parser,
+  fetcher and booking-page integration against a local feed server).
 - Run locally: `DATA_DIR=./data npm start` (or `node server.js`).
