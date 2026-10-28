@@ -6,6 +6,9 @@ the people who hold its token.
 
 ## What works today (booking core)
 
+- A public landing page (`/`) with the honest list of what the product checks and what it
+  does not, and — where a demo organizer is seeded (`DEMO_SEED=1`, set on the deployed
+  stack) — a link to a live demo: a real booking page anyone can book, end to end.
 - Organizer signup/sign-in (private accounts, scrypt-hashed passwords, signed session cookies).
 - Weekly availability (one window per weekday) with a slot duration, set in the organizer's time zone.
 - A shareable booking page: guests pick a day and slot, and every slot shows the time in

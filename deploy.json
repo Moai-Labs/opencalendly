@@ -9,7 +9,8 @@
       "count": 1,
       "volume_gb": 1,
       "env": {
-        "PAY_TEST_ADDRESS": "0x2f50aa285c060f4a579f2c0256e8b7a754b1205d"
+        "PAY_TEST_ADDRESS": "0x2f50aa285c060f4a579f2c0256e8b7a754b1205d",
+        "DEMO_SEED": "1"
       },
       "public": true
     }
