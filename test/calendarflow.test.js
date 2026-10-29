@@ -220,10 +220,10 @@ test("a connected feed hides busy times and the pages say so honestly", async ()
     assert.equal(off.status, 303);
     const afterOff = await get(ctx, `${ctx.base}/dashboard`, { cookie });
     const afterOffHtml = await afterOff.text();
-    assert.match(afterOffHtml, /Connect one external calendar/);
+    assert.match(afterOffHtml, /An external calendar is checked only when one is connected/);
     assert.equal(organizer().calendar, null);
     const plainPage = await get(ctx, `${ctx.base}/b/${organizer().slug}`);
-    assert.match(await plainPage.text(), /We do not check external calendars/);
+    assert.match(await plainPage.text(), /No external calendar is connected, so nothing external is checked/);
 
     // The busy slot is bookable again for a fresh guest once disconnected.
     const rebook = await post(`${ctx.base}/b/${organizer().slug}/book`, {
