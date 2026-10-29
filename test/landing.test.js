@@ -63,6 +63,12 @@ test("landing page advertises the live demo only when it exists", async () => {
   assert.match(html, /What this checks — and what it does not/);
   assert.match(html, /test-USDC/);
   assert.match(html, /href="\/signup"/);
+  // One truth about external calendars, stated conditionally — never as an
+  // unconditional "we check" or "we do not check".
+  assert.match(html, /External calendars — checked only when connected/);
+  assert.match(html, /With no calendar\s+connected, nothing external is checked/);
+  assert.doesNotMatch(html, /read-only checking of one external calendar, which hides/);
+  assert.doesNotMatch(html, /We do not check external calendars/);
 
   const noDemo = await start();
   const plain = await (await fetch(`${noDemo.base}/`)).text();

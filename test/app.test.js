@@ -104,7 +104,7 @@ test("a guest books a slot without an account and gets confirmation, both time z
   const pageHtml = await page.text();
   assert.ok(pageHtml.includes("Europe/Berlin"), "organizer zone shown");
   assert.ok(pageHtml.includes("America/New_York"), "guest zone shown");
-  assert.ok(pageHtml.includes("do not check external calendars"), "the external-calendar note is shown");
+  assert.ok(pageHtml.includes("nothing external is checked"), "the external-calendar note is shown");
 
   const startIso = await firstSlotStart(ctx, org.slug, "America/New_York");
   const bookRes = await post(`${ctx.base}/b/${org.slug}/book`, {
@@ -201,6 +201,43 @@ test("each booking has a calendar file with UTC times and the honest note", asyn
   assert.match(ics, new RegExp(`DTSTART:${startIso.replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}`));
   assert.match(ics, /does not check the organizer's external calendars/);
   assert.match(ics, /UID:[0-9a-f]+@opencalendly/);
+});
+
+test("the calendar file speaks the guest's zone, not the organizer's", async () => {
+  const ctx = await start();
+  const org = await signup(ctx); // organizer stays in UTC
+  const startIso = await firstSlotStart(ctx, org.slug);
+  const bookRes = await post(`${ctx.base}/b/${org.slug}/book`, {
+    start: startIso, tz: "America/New_York", guest_name: "Grace", guest_email: "grace@example.com",
+  });
+  assert.strictEqual(bookRes.status, 303);
+  const id = bookRes.headers.get("location").match(/confirmed\/([0-9a-f]+)/)[1];
+  const unfold = (t) => t.replace(/\r\n /g, "");
+
+  // No tz on the link: the zone the guest booked in is used.
+  const ics = unfold(await (await fetch(`${ctx.base}/cal/${id}.ics`)).text());
+  assert.match(ics, /Your time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \(America\/New_York\)/);
+  assert.match(ics, /Organizer time: .+ \(UTC\)/);
+
+  // An explicit tz on the link still wins over the stored zone.
+  const forced = unfold(await (await fetch(`${ctx.base}/cal/${id}.ics?tz=Asia/Tokyo`)).text());
+  assert.match(forced, /Your time: .+ \(Asia\/Tokyo\)/);
+
+  await ctx.close();
+});
+
+test("the dashboard's copy points the right way and states the calendar truth", async () => {
+  const ctx = await start();
+  const org = await signup(ctx);
+  const dash = await (await fetch(`${ctx.base}/dashboard`, { headers: { cookie: org.cookie } })).text();
+  // The link section sits above the bookings table, so the empty-table copy points up.
+  assert.match(dash, /Your booking link is above/);
+  assert.doesNotMatch(dash, /Share your link below/);
+  // One truth about external calendars, organizer-facing.
+  assert.match(dash, /No external calendar is connected, so nothing external is checked/);
+  assert.match(dash, /checked only when one is connected/);
+  assert.doesNotMatch(dash, /We do not check external calendars/);
+  await ctx.close();
 });
 
 test("state restores across a restart: bookings persist, logins survive, the booked slot stays gone", async () => {
